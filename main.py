@@ -1,8 +1,3 @@
-from fastapi import FastAPI
+"""本地启动入口：uv run fastapi dev main.py"""
 
-app = FastAPI()
-
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+from object_storage.app import app  # noqa: F401
