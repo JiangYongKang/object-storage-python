@@ -8,6 +8,7 @@ import hashlib
 from fastapi.testclient import TestClient
 
 from main import app, store
+from storage import ObjectStore, RecoveryPolicy
 
 
 def b64(data: bytes) -> str:
@@ -67,4 +68,51 @@ def test_http_multipart_and_error_shape():
     assert r.status_code == 404
     assert r.json()["error"]["reason"] == "object_not_found"
 
-    store.delete_object(key)  # 清理，保证用例可重复执行
+    store.reset()  # 清理，保证用例可重复执行
+
+
+def test_http_rollback_recoverable_delete_and_idempotency():
+    client = TestClient(app)
+    key = "http-recover-doc"
+    log("HTTP 回滚与可恢复删除",
+        "写 v1/v2→回滚 v1→幂等删除两次→恢复→重复恢复/超窗错误",
+        "回滚/恢复返回新版本；同一删除键两次结论一致；重复恢复 409 object_not_deleted")
+
+    # 为该用例临时打开恢复窗口（纯内存，用例结束后恢复默认）
+    saved_recovery = store._recovery
+    store._recovery = RecoveryPolicy(recover_seconds=3600)
+    try:
+        assert client.put(f"/objects/{key}", json={"data_b64": b64(b"one")}).status_code == 200
+        assert client.put(f"/objects/{key}", json={"data_b64": b64(b"two")}).status_code == 200
+
+        r = client.post(f"/objects/{key}/rollback", json={"version_id": 1})
+        assert r.status_code == 200, r.text
+        assert r.json()["version_id"] == 3
+        assert base64.b64decode(client.get(f"/objects/{key}").json()["data_b64"]) == b"one"
+
+        # 幂等删除：同一键两次结论一致（同一 version_id）
+        r1 = client.delete(f"/objects/{key}?idempotency_key=del1")
+        r2 = client.delete(f"/objects/{key}?idempotency_key=del1")
+        assert r1.status_code == r2.status_code == 200
+        assert r1.json()["version_id"] == r2.json()["version_id"] == 4
+        assert client.get(f"/objects/{key}").status_code == 404
+
+        # 恢复
+        r = client.post(f"/objects/{key}/recover", json={"idempotency_key": "rec1"})
+        assert r.status_code == 200, r.text
+        assert r.json()["version_id"] == 5
+        assert base64.b64decode(client.get(f"/objects/{key}").json()["data_b64"]) == b"one"
+
+        # 重复恢复：对象已存活 → 409 object_not_deleted
+        r = client.post(f"/objects/{key}/recover", json={})
+        assert r.status_code == 409
+        assert r.json()["error"]["reason"] == "object_not_deleted"
+
+        # 回滚到不存在版本 → 404 version_not_found
+        r = client.post(f"/objects/{key}/rollback", json={"version_id": 99})
+        assert r.status_code == 404
+        assert r.json()["error"]["reason"] == "version_not_found"
+    finally:
+        store._recovery = saved_recovery
+
+    store.reset()  # 清理，保证用例可重复执行

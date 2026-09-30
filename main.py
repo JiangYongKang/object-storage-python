@@ -9,9 +9,16 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from storage import ObjectStore, QuotaPolicy, RejectReason, RetentionPolicy, StorageRejected
+from storage import (
+    ObjectStore,
+    QuotaPolicy,
+    RecoveryPolicy,
+    RejectReason,
+    RetentionPolicy,
+    StorageRejected,
+)
 
-# 配额与保留策略可通过环境变量配置，默认不限制
+# 配额、保留与恢复窗口可通过环境变量配置，默认不限制 / 不可恢复
 store = ObjectStore(
     quota=QuotaPolicy(
         max_bytes=int(os.environ["QUOTA_MAX_BYTES"]) if "QUOTA_MAX_BYTES" in os.environ else None,
@@ -20,11 +27,18 @@ store = ObjectStore(
     retention=RetentionPolicy(
         retain_seconds=float(os.environ.get("RETAIN_SECONDS", "0"))
     ),
+    recovery=RecoveryPolicy(
+        recover_seconds=float(os.environ.get("RECOVER_SECONDS", "0"))
+    ),
 )
 
 app = FastAPI(title="local-object-storage")
 
-_NOT_FOUND = {RejectReason.OBJECT_NOT_FOUND, RejectReason.UPLOAD_NOT_FOUND}
+_NOT_FOUND = {
+    RejectReason.OBJECT_NOT_FOUND,
+    RejectReason.UPLOAD_NOT_FOUND,
+    RejectReason.VERSION_NOT_FOUND,
+}
 
 
 @app.exception_handler(StorageRejected)
@@ -63,6 +77,15 @@ class CompleteBody(BaseModel):
     idempotency_key: str | None = None
 
 
+class RollbackBody(BaseModel):
+    version_id: int
+    idempotency_key: str | None = None
+
+
+class IdempotentBody(BaseModel):
+    idempotency_key: str | None = None
+
+
 @app.put("/objects/{key}")
 def put_object(key: str, body: PutBody):
     v = store.put_object(key, _unb64(body.data_b64), body.idempotency_key)
@@ -82,9 +105,21 @@ def get_object(key: str, version_id: int | None = None):
 
 
 @app.delete("/objects/{key}")
-def delete_object(key: str):
-    v = store.delete_object(key)
+def delete_object(key: str, idempotency_key: str | None = None):
+    v = store.delete_object(key, idempotency_key)
     return {"key": v.key, "version_id": v.version_id, "deleted": True}
+
+
+@app.post("/objects/{key}/rollback")
+def rollback_object(key: str, body: RollbackBody):
+    v = store.rollback_object(key, body.version_id, body.idempotency_key)
+    return {"key": v.key, "version_id": v.version_id, "checksum": v.checksum, "size": v.size}
+
+
+@app.post("/objects/{key}/recover")
+def recover_object(key: str, body: IdempotentBody = IdempotentBody()):
+    v = store.recover_object(key, body.idempotency_key)
+    return {"key": v.key, "version_id": v.version_id, "checksum": v.checksum, "size": v.size}
 
 
 @app.get("/objects/{key}/versions")

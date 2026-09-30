@@ -20,6 +20,12 @@ class RejectReason(str, Enum):
     RETENTION_VIOLATION = "retention_violation"    # 违反保留策略（保留期内禁止覆盖/删除）
     # 读取
     OBJECT_NOT_FOUND = "object_not_found"          # 对象不存在或已删除
+    # 回滚与可恢复删除
+    VERSION_NOT_FOUND = "version_not_found"        # 指定的历史版本不存在
+    VERSION_NOT_RESTORABLE = "version_not_restorable"  # 目标版本是墓碑，无法回滚到它
+    OBJECT_NOT_DELETED = "object_not_deleted"      # 对象未处于删除状态，恢复无意义
+    RECOVERY_WINDOW_EXPIRED = "recovery_window_expired"  # 已超过可恢复窗口
+    IDEMPOTENCY_CONFLICT = "idempotency_conflict"  # 同一幂等键提交了不同操作
 
 
 class StorageRejected(Exception):
