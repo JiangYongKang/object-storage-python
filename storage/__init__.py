@@ -4,6 +4,7 @@ from .models import (
     ObjectVersion,
     Part,
     QuotaPolicy,
+    RecoveryPolicy,
     RetentionPolicy,
 )
 from .store import ObjectStore
@@ -14,6 +15,7 @@ __all__ = [
     "ObjectVersion",
     "Part",
     "QuotaPolicy",
+    "RecoveryPolicy",
     "RejectReason",
     "RetentionPolicy",
     "StorageRejected",

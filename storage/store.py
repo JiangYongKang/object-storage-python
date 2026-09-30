@@ -20,6 +20,7 @@ from .models import (
     ObjectVersion,
     Part,
     QuotaPolicy,
+    RecoveryPolicy,
     RetentionPolicy,
 )
 
@@ -33,16 +34,19 @@ class ObjectStore:
         self,
         quota: QuotaPolicy | None = None,
         retention: RetentionPolicy | None = None,
+        recovery: RecoveryPolicy | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._quota = quota or QuotaPolicy()
         self._retention = retention or RetentionPolicy()
+        self._recovery = recovery or RecoveryPolicy()
         self._clock = clock
         self._lock = threading.RLock()
         # key -> 版本列表（version_id 升序，最后一个为当前版本）
         self._versions: dict[str, list[ObjectVersion]] = {}
         self._uploads: dict[str, MultipartUpload] = {}
-        # 幂等键 -> 首次提交产生的版本（重复提交直接返回它）
+        # 幂等记录：键为「操作作用域 + 重试标识」的复合键，保证同一重试标识
+        # 用在不同对象 / 不同上传 / 不同操作类型之间互不串味。
         self._committed: dict[str, ObjectVersion] = {}
         self._used_bytes = 0
 
@@ -85,11 +89,12 @@ class ObjectStore:
                     f"对象数量将达到 {live + 1}，超过上限 {self._quota.max_objects}",
                 )
 
-    def _commit(self, key: str, data: bytes, idempotency_key: str | None) -> ObjectVersion:
-        if idempotency_key is not None and idempotency_key in self._committed:
-            return self._committed[idempotency_key]  # 幂等重放：返回首次结论
-        self._check_retention(key)
-        self._check_quota(key, len(data))
+    @staticmethod
+    def _idem_scope(kind: str, *parts: str) -> str:
+        return "\u0000".join((kind, *parts))
+
+    def _append_version(self, key: str, data: bytes) -> ObjectVersion:
+        """追加一个新版本。调用方须已完成保留/配额校验并持锁。"""
         versions = self._versions.setdefault(key, [])
         current = self._current(key)
         self._used_bytes += len(data) - (current.size if current else 0)
@@ -102,8 +107,27 @@ class ObjectStore:
             created_at=self._clock(),
         )
         versions.append(version)
-        if idempotency_key is not None:
-            self._committed[idempotency_key] = version
+        return version
+
+    def _commit(
+        self,
+        key: str,
+        data: bytes,
+        idempotency_key: str | None,
+        scope: str = "put",
+    ) -> ObjectVersion:
+        scope_key = (
+            None
+            if idempotency_key is None
+            else self._idem_scope(scope, key, idempotency_key)
+        )
+        if scope_key is not None and scope_key in self._committed:
+            return self._committed[scope_key]  # 幂等重放：返回首次结论
+        self._check_retention(key)
+        self._check_quota(key, len(data))
+        version = self._append_version(key, data)
+        if scope_key is not None:
+            self._committed[scope_key] = version
         return version
 
     # ---- 简单写入 / 读取 / 删除 ----
@@ -139,16 +163,34 @@ class ObjectStore:
                 )
             return version
 
-    def delete_object(self, key: str) -> ObjectVersion:
+    def delete_object(
+        self, key: str, idempotency_key: str | None = None
+    ) -> ObjectVersion:
         with self._lock:
-            current = self._current(key)
-            if current is None:
+            versions = self._versions.get(key)
+            scope_key = (
+                self._idem_scope("delete", key, idempotency_key)
+                if idempotency_key is not None
+                else None
+            )
+            latest = versions[-1] if versions else None
+            # 幂等重放：对象当前仍处于删除态时，首次墓碑就是确定结论。
+            # 若期间已被恢复（当前为存活版本），旧结论失效，重新执行删除。
+            if (
+                scope_key is not None
+                and scope_key in self._committed
+                and latest is not None
+                and latest.deleted
+            ):
+                return self._committed[scope_key]
+            if latest is None:
                 raise StorageRejected(
                     RejectReason.OBJECT_NOT_FOUND, f"key={key!r} 不存在，无法删除"
                 )
+            if latest.deleted:
+                return latest  # 重复删除：结论一致，不新增墓碑、不重复释放配额
             self._check_retention(key)
-            versions = self._versions[key]
-            self._used_bytes -= current.size
+            self._used_bytes -= latest.size
             tombstone = ObjectVersion(
                 key=key,
                 version_id=len(versions) + 1,
@@ -159,7 +201,119 @@ class ObjectStore:
                 deleted=True,
             )
             versions.append(tombstone)
+            if scope_key is not None:
+                self._committed[scope_key] = tombstone
             return tombstone
+
+    def rollback_object(
+        self, key: str, version_id: int, idempotency_key: str | None = None
+    ) -> ObjectVersion:
+        """把存活对象回滚到历史上的完整版本，作为一次新版本提交。"""
+        with self._lock:
+            versions = self._versions.get(key)
+            scope_key = (
+                self._idem_scope("rollback", key, idempotency_key)
+                if idempotency_key is not None
+                else None
+            )
+            latest = versions[-1] if versions else None
+            # 幂等重放：自首次回滚后对象没有新的提交时，结论仍然有效。
+            if (
+                scope_key is not None
+                and scope_key in self._committed
+                and latest is self._committed[scope_key]
+            ):
+                return self._committed[scope_key]
+            if latest is None:
+                raise StorageRejected(
+                    RejectReason.OBJECT_NOT_FOUND,
+                    f"key={key!r} 不存在，无法回滚",
+                )
+            if latest.deleted:
+                raise StorageRejected(
+                    RejectReason.OBJECT_NOT_FOUND,
+                    f"key={key!r} 当前为删除状态；恢复窗口内请使用 restore_object",
+                )
+            target = next(
+                (v for v in versions if v.version_id == version_id), None
+            )
+            if target is None:
+                raise StorageRejected(
+                    RejectReason.OBJECT_NOT_FOUND,
+                    f"key={key!r} 没有 version_id={version_id}",
+                )
+            if target.deleted:
+                raise StorageRejected(
+                    RejectReason.OBJECT_NOT_FOUND,
+                    f"key={key!r} version={version_id} 是删除标记，不能作为回滚目标",
+                )
+            # 与普通写入相同：保留期内的当前版本禁止覆盖；按目标内容检查配额。
+            self._check_retention(key)
+            self._check_quota(key, target.size)
+            version = self._append_version(key, target.data)
+            if scope_key is not None:
+                self._committed[scope_key] = version
+            return version
+
+    def restore_object(
+        self, key: str, idempotency_key: str | None = None
+    ) -> ObjectVersion:
+        """在删除恢复窗口内，把已删除对象恢复到删除前的完整版本。"""
+        with self._lock:
+            versions = self._versions.get(key)
+            scope_key = (
+                self._idem_scope("restore", key, idempotency_key)
+                if idempotency_key is not None
+                else None
+            )
+            latest = versions[-1] if versions else None
+            # 幂等重放：自首次恢复后对象没有被再次删除时，结论仍然有效。
+            if (
+                scope_key is not None
+                and scope_key in self._committed
+                and latest is self._committed[scope_key]
+            ):
+                return self._committed[scope_key]
+            if latest is None:
+                raise StorageRejected(
+                    RejectReason.OBJECT_NOT_FOUND,
+                    f"key={key!r} 不存在，无法恢复",
+                )
+            if not latest.deleted:
+                raise StorageRejected(
+                    RejectReason.OBJECT_NOT_DELETED,
+                    f"key={key!r} 当前存活（version={latest.version_id}），无需恢复",
+                )
+            window = self._recovery.recover_seconds
+            if window <= 0:
+                raise StorageRejected(
+                    RejectReason.RECOVERY_WINDOW_EXPIRED,
+                    f"key={key!r} 未配置删除恢复窗口（recover_seconds={window}），"
+                    "删除为终态，无法恢复",
+                )
+            age = self._clock() - latest.created_at
+            if age > window:
+                raise StorageRejected(
+                    RejectReason.RECOVERY_WINDOW_EXPIRED,
+                    f"key={key!r} 删除已过 {age:.3f}s，超过恢复窗口 {window}s，"
+                    "无法恢复",
+                )
+            # 删除前最近的一份完整版本即为恢复目标。
+            target = next(
+                (v for v in reversed(versions) if not v.deleted), None
+            )
+            if target is None:
+                # 理论上不可达：墓碑前必有存活版本；保留为明确拒绝而非崩溃。
+                raise StorageRejected(
+                    RejectReason.OBJECT_NOT_FOUND,
+                    f"key={key!r} 历史中没有可恢复的完整版本",
+                )
+            # 恢复等于重新写入：历史版本仍占元数据空间，容量/数量按新生计配额。
+            self._check_quota(key, target.size)
+            version = self._append_version(key, target.data)
+            if scope_key is not None:
+                self._committed[scope_key] = version
+            return version
 
     def list_versions(self, key: str) -> list[ObjectVersion]:
         with self._lock:
@@ -239,10 +393,16 @@ class ObjectStore:
         self, upload_id: str, idempotency_key: str | None = None
     ) -> ObjectVersion:
         with self._lock:
-            # 幂等：同一提交键已完成过，直接返回首次结论
-            if idempotency_key is not None and idempotency_key in self._committed:
-                return self._committed[idempotency_key]
             upload = self._get_upload(upload_id)
+            # 幂等：同一「上传会话 + 提交键」已完成过，直接返回首次结论；
+            # 作用域含 upload_id，同一重试标识用于不同上传互不影响。
+            scope_key = (
+                self._idem_scope("complete", upload_id, idempotency_key)
+                if idempotency_key is not None
+                else None
+            )
+            if scope_key is not None and scope_key in self._committed:
+                return self._committed[scope_key]
             self._require_active(upload)
             missing = [
                 n for n in range(1, upload.part_count + 1) if n not in upload.parts
@@ -253,7 +413,11 @@ class ObjectStore:
                     f"缺少分片 {missing}，无法完成合并",
                 )
             data = b"".join(upload.parts[n].data for n in sorted(upload.parts))
-            version = self._commit(upload.key, data, idempotency_key)
+            self._check_retention(upload.key)
+            self._check_quota(upload.key, len(data))
+            version = self._append_version(upload.key, data)
+            if scope_key is not None:
+                self._committed[scope_key] = version
             upload.state = "completed"
             upload.parts.clear()  # 合并后释放半成品
             return version
@@ -271,3 +435,7 @@ class ObjectStore:
     def used_bytes(self) -> int:
         with self._lock:
             return self._used_bytes
+
+    @property
+    def recovery_policy(self) -> RecoveryPolicy:
+        return self._recovery

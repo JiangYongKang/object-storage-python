@@ -52,3 +52,10 @@ class RetentionPolicy:
     """保留策略：版本创建后 retain_seconds 内禁止被覆盖或删除。"""
 
     retain_seconds: float = 0.0
+
+
+@dataclass(frozen=True)
+class RecoveryPolicy:
+    """删除恢复策略：删除后 recover_seconds 窗口内可恢复；<=0 表示删除即终态。"""
+
+    recover_seconds: float = 0.0

@@ -9,9 +9,16 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from storage import ObjectStore, QuotaPolicy, RejectReason, RetentionPolicy, StorageRejected
+from storage import (
+    ObjectStore,
+    QuotaPolicy,
+    RecoveryPolicy,
+    RejectReason,
+    RetentionPolicy,
+    StorageRejected,
+)
 
-# 配额与保留策略可通过环境变量配置，默认不限制
+# 配额、保留与删除恢复策略可通过环境变量配置，默认不限制 / 删除即终态
 store = ObjectStore(
     quota=QuotaPolicy(
         max_bytes=int(os.environ["QUOTA_MAX_BYTES"]) if "QUOTA_MAX_BYTES" in os.environ else None,
@@ -20,11 +27,19 @@ store = ObjectStore(
     retention=RetentionPolicy(
         retain_seconds=float(os.environ.get("RETAIN_SECONDS", "0"))
     ),
+    recovery=RecoveryPolicy(
+        recover_seconds=float(os.environ.get("RECOVER_SECONDS", "0"))
+    ),
 )
 
 app = FastAPI(title="local-object-storage")
 
-_NOT_FOUND = {RejectReason.OBJECT_NOT_FOUND, RejectReason.UPLOAD_NOT_FOUND}
+# 仅“资源不存在”类原因映射为 404；状态冲突（含恢复窗口过期、对象未删除、
+# 配额超限、保留期冲突等）统一 409，响应体结构一致。
+_NOT_FOUND = {
+    RejectReason.OBJECT_NOT_FOUND,
+    RejectReason.UPLOAD_NOT_FOUND,
+}
 
 
 @app.exception_handler(StorageRejected)
@@ -46,6 +61,19 @@ def _unb64(text: str) -> bytes:
 
 class PutBody(BaseModel):
     data_b64: str
+    idempotency_key: str | None = None
+
+
+class DeleteBody(BaseModel):
+    idempotency_key: str | None = None
+
+
+class RollbackBody(BaseModel):
+    version_id: int
+    idempotency_key: str | None = None
+
+
+class RestoreBody(BaseModel):
     idempotency_key: str | None = None
 
 
@@ -82,19 +110,36 @@ def get_object(key: str, version_id: int | None = None):
 
 
 @app.delete("/objects/{key}")
-def delete_object(key: str):
-    v = store.delete_object(key)
+def delete_object(key: str, body: DeleteBody | None = None):
+    idem = body.idempotency_key if body is not None else None
+    v = store.delete_object(key, idem)
     return {"key": v.key, "version_id": v.version_id, "deleted": True}
+
+
+@app.post("/objects/{key}/rollback")
+def rollback_object(key: str, body: RollbackBody):
+    v = store.rollback_object(key, body.version_id, body.idempotency_key)
+    return {"key": v.key, "version_id": v.version_id, "checksum": v.checksum, "size": v.size}
+
+
+@app.post("/objects/{key}/restore")
+def restore_object(key: str, body: RestoreBody | None = None):
+    idem = body.idempotency_key if body is not None else None
+    v = store.restore_object(key, idem)
+    return {"key": v.key, "version_id": v.version_id, "checksum": v.checksum, "size": v.size}
 
 
 @app.get("/objects/{key}/versions")
 def list_versions(key: str):
-    return {
-        "versions": [
-            {"version_id": v.version_id, "size": v.size, "deleted": v.deleted}
-            for v in store.list_versions(key)
-        ]
-    }
+    recover_seconds = store.recovery_policy.recover_seconds
+
+    def item(v) -> dict:
+        d = {"version_id": v.version_id, "size": v.size, "deleted": v.deleted}
+        if v.deleted and recover_seconds > 0:
+            d["restorable_until"] = v.created_at + recover_seconds
+        return d
+
+    return {"versions": [item(v) for v in store.list_versions(key)]}
 
 
 @app.post("/uploads/{key}")

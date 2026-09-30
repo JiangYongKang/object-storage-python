@@ -18,8 +18,11 @@ class RejectReason(str, Enum):
     QUOTA_BYTES_EXCEEDED = "quota_bytes_exceeded"  # 超出容量配额
     QUOTA_OBJECTS_EXCEEDED = "quota_objects_exceeded"  # 超出对象数量配额
     RETENTION_VIOLATION = "retention_violation"    # 违反保留策略（保留期内禁止覆盖/删除）
+    # 回滚与可恢复删除
+    RECOVERY_WINDOW_EXPIRED = "recovery_window_expired"  # 删除恢复窗口已过，无法恢复
+    OBJECT_NOT_DELETED = "object_not_deleted"            # 对象未处于删除状态，无法恢复
     # 读取
-    OBJECT_NOT_FOUND = "object_not_found"          # 对象不存在或已删除
+    OBJECT_NOT_FOUND = "object_not_found"          # 对象不存在、已删除或目标版本不可用
 
 
 class StorageRejected(Exception):
