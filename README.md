@@ -43,12 +43,39 @@
 - **恢复与配额/保留的交互**：删除已立即释放容量，恢复相当于重新写入删除前的内容，
   因此受容量（及数量）配额约束，超限拒绝且状态不变；恢复不覆盖/删除任何已有版本，
   **不受保留期限制**，恢复出的新版本从恢复时刻重新计时，之后对它的覆盖/删除仍受保留期保护。
-- **幂等**：写入/合并/删除/回滚/恢复均可携带 `idempotency_key`。幂等记录按
-  **（对象 key, 幂等键）作用域**保存首次结论：同一笔提交的重复调用永远返回同一结果，
-  不重复占用配额、不多出版本；同一个重试标识用在不同对象或不同上传之间完全隔离、
-  互不重放。同一（对象, 幂等键）若先用于一种操作（如写入）又用于另一种操作（如回滚），
-  返回 `idempotency_conflict` 明确拒绝，绝不“接口说成功、对象却没变”。
-  不带幂等键的重复删除结论同样稳定：对象已删除后一律返回 `object_not_found`。
+- **幂等重试标识（idempotency_key）的作用域**：写入/合并/删除/回滚/恢复均可携带
+  `idempotency_key`，作用域**精确到“这一笔提交”**：
+  - 直接写入/删除/回滚/恢复按 **（对象 key, 幂等键）** 判重——同一条标识只在同一对象
+    内有效，用在不同对象上完全隔离；
+  - 分块上传的 `complete_upload` 按 **（upload_id, 幂等键）** 判重——同一对象上开的
+    **两个不同上传会话即使共用同一条标识，也各自得到自己的合并结果，互不顶替、互不丢弃**；
+  - 同一作用域内，同一笔提交在**对象状态没变**时重复调用，结论永远稳定：返回同一结果、
+    不重复占配额、不多出版本；
+  - 同一作用域若先用于一种操作（如写入）又用于另一种操作（如回滚），返回
+    `idempotency_conflict` 明确拒绝。
+
+### 状态被改动之后的重试语义
+
+重试只在“对象当前状态仍停在这笔提交的结论上”时重放旧结论；两次调用之间对象若已被
+**别的提交**改动（恢复、新写入、另一次删除等），带状态的操作（删除/回滚/恢复）会按
+**当前状态重新执行**，绝不返回与当前可读状态对不上的旧成功结论：
+
+- **重复删除**：先用标识 `d` 删除，窗口内又 `recover` 回来，再用同一个 `d` 重试删除——
+  重试会**真的再删一次**：成功后对象立即读不到（`object_not_found`），追加新的墓碑版本、
+  版本历史连续不乱；若此时恢复出的新版本**仍在保留期**，重试返回
+  `retention_violation` 且对象保持存活、版本与容量原样不动；对象已被另一笔提交删除时
+  返回 `object_not_found`。
+- **重复回滚**：先回滚到历史版本 V，之后对象又被写入了新内容，再用同一条标识重试回滚——
+  重试会**重新追加一个内容为 V 的新版本**，成功后紧接着读到的必为 V 的数据；回滚之后的
+  正常写入不会被覆盖或丢失（按 `version_id` 仍可读出）。若重试时对象已被删除，返回
+  `object_not_found`（请先 recover）；若重新回滚会**超出配额**，返回
+  `quota_bytes_exceeded`——两种拒绝都不改对象、不增版本、不动容量。
+- **重复恢复**：恢复后对象又被删除，同标识重试按“最近一次删除”重新恢复：仍在窗口内就
+  再次恢复，**超出恢复窗口**返回 `recovery_window_expired`；对象当前已存活（如恢复后又
+  写入）则返回 `object_not_deleted`。拒绝均不改状态。
+- 直接写入/合并的重放只代表“这一笔提交产生过这个版本”：重试返回该笔版本本身，即使对象
+  后来被别的提交改动，也**不会**再追加版本或把当前内容顶回去（后来的写入不丢）。
+- 不带幂等键的重复删除结论同样稳定：对象已删除后一律返回 `object_not_found`。
 
 ## 拒绝原因（reason 码）
 
@@ -97,7 +124,8 @@ HTTP 入口下，`object_not_found` / `upload_not_found` / `version_not_found` �
 
 ```bash
 uv sync                 # 安装依赖
-uv run pytest -q -s     # 运行全部测试，-s 可看到每个用例打印的输入与判定依据
+uv run pytest -v -s     # 运行全部测试：开头打印“业务覆盖清单”，结尾打印“各业务结论”，
+                        # -s 可看到每个用例打印的输入与判定依据
 uv run uvicorn main:app # 启动 HTTP 服务（默认 127.0.0.1:8000）
 ```
 
@@ -115,13 +143,61 @@ now[0] += 31                       # 越过窗口
 store.recover_object("k")          # -> recovery_window_expired
 ```
 
-测试覆盖：分块上传完整流程、缺失/重复/越界分片、校验和失败、中止与已完成会话的
-后续操作、并发写入无污染、并发读写不撕裂、覆盖/删除的可见性、容量与数量配额、
-保留期约束、写入与合并提交的幂等重放，以及 HTTP 入口错误结构的一致性；
-新增覆盖**按历史版本回滚（留痕/历史稳定可读/保留与配额约束）、窗口内删除恢复、
-超窗与未配置窗口拒绝、删除-恢复-再删除链路、重复删除与重复回滚/恢复的幂等重试、
-重试标识在不同对象与不同上传之间的隔离、同一键跨操作冲突，以及回滚/删除/恢复/
-写入的并发一致性**。全部用例纯内存执行，可复现，不依赖外部服务或网络。
+在本地直接验证三处重试语义（均为纯内存调用）：
+
+```python
+import hashlib
+from storage import ObjectStore, RecoveryPolicy
+
+def sha(b): return hashlib.sha256(b).hexdigest()
+
+# 1) 删除 -> 窗口内恢复 -> 同一标识重试删除：成功后必真删掉
+s = ObjectStore(recovery=RecoveryPolicy(recover_seconds=30))
+s.put_object("k", b"data")
+s.delete_object("k", idempotency_key="d")
+s.recover_object("k")
+s.delete_object("k", idempotency_key="d")   # 重新生效，不是旧结论
+s.get_object("k")                            # -> object_not_found
+
+# 2) 回滚 -> 新写入 -> 同一标识重试回滚：读到的即回滚目标
+s = ObjectStore()
+v1 = s.put_object("k", b"one")
+s.put_object("k", b"two")
+s.rollback_object("k", v1.version_id, idempotency_key="r")
+s.put_object("k", b"three")
+s.rollback_object("k", v1.version_id, idempotency_key="r")
+assert s.get_object("k").data == b"one"      # 结论与现状一致；b"three" 仍可按版本读出
+
+# 3) 同一对象两个上传会话共用同一条标识：各得各的结果
+s = ObjectStore()
+u1 = s.create_upload("k", part_count=1)
+s.upload_part(u1.upload_id, 1, b"AAA", sha(b"AAA"))
+s.complete_upload(u1.upload_id, idempotency_key="c")
+u2 = s.create_upload("k", part_count=1)
+s.upload_part(u2.upload_id, 1, b"BBB", sha(b"BBB"))
+s.complete_upload(u2.upload_id, idempotency_key="c")
+assert s.get_object("k").data == b"BBB"      # 第二个会话的内容不被丢弃/顶替
+```
+
+专项用例位于 `tests/test_idempotent_retry.py`，按业务分组（日志开头/结尾均可见）：
+
+| 业务 | 用例 |
+| --- | --- |
+| A 删除后窗口内恢复，再用同一标识重复删除（真删、历史不乱、重放稳定） | `test_delete_retry_after_recover_actually_deletes` |
+| B 恢复后仍在保留期，重复删除被拒且状态不变；期满后重试成功 | `test_delete_retry_within_retention_rejected_state_unchanged` |
+| C 回滚后又写入新内容，同标识重复回滚（读到目标、新写入不丢） | `test_rollback_retry_after_new_write_matches_target` |
+| D 重复回滚时对象已删除 / 超配额被拒，状态原样 | `test_rollback_retry_when_deleted_rejected_state_unchanged`、`test_rollback_retry_quota_exceeded_state_unchanged` |
+| E 同一对象两个上传会话共用同一标识互不顶替 | `test_two_upload_sessions_same_idem_key_isolated` |
+| F 重复恢复超出窗口 / 对象已存活被拒，状态不变 | `test_recover_retry_after_window_expired_state_unchanged`、`test_recover_retry_when_live_state_unchanged` |
+| G 并发回滚/删除/恢复/写入，每次读取都对应某一完整版本 | `test_concurrent_mixed_ops_reads_always_complete_version` |
+
+此外，原有用例继续覆盖：分块上传完整流程、缺失/重复/越界分片、校验和失败、中止与
+已完成会话的后续操作、并发写入无污染、并发读写不撕裂、覆盖/删除的可见性、容量与数量
+配额、保留期约束、写入/合并/创建上传的幂等重放、**按历史版本回滚（留痕/历史稳定可读/
+保留与配额约束）、窗口内删除恢复、超窗与未配置窗口拒绝、删除-恢复-再删除链路、
+重复回滚/恢复的幂等重试、重试标识在不同对象之间的隔离、同一键跨操作冲突、
+回滚/删除/恢复/写入的并发一致性**，以及 HTTP 入口（含三处重试场景的端到端用例）的
+错误结构一致性。全部用例纯内存执行，可复现，不依赖外部服务或网络。
 
 ## 兼容范围
 

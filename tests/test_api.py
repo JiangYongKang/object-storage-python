@@ -116,3 +116,57 @@ def test_http_rollback_recoverable_delete_and_idempotency():
         store._recovery = saved_recovery
 
     store.reset()  # 清理，保证用例可重复执行
+
+
+def test_http_retry_after_state_change_and_upload_isolation():
+    client = TestClient(app)
+    key = "http-retry-doc"
+    log("HTTP 重试语义：恢复后重删、新写后重回滚、两会话共用标识",
+        "删除(del)->恢复->同键重删(须真404)；回滚(rb)->新写->同键重回滚(须读到目标)；"
+        "两个上传会话 complete 共用 c 各自生效",
+        "成功结论与随后读到的状态始终一致；第二个会话内容不丢")
+    saved_recovery = store._recovery
+    store._recovery = RecoveryPolicy(recover_seconds=3600)
+    try:
+        client.put(f"/objects/{key}", json={"data_b64": b64(b"data")})
+
+        # 删除 -> 恢复 -> 同一重试标识再删除：必须真删掉
+        assert client.delete(f"/objects/{key}?idempotency_key=del").status_code == 200
+        assert client.post(f"/objects/{key}/recover", json={}).status_code == 200
+        r = client.delete(f"/objects/{key}?idempotency_key=del")
+        assert r.status_code == 200
+        assert client.get(f"/objects/{key}").status_code == 404
+
+        # 再恢复 -> 写 b'two' -> 回滚到最早存活版本(rb) -> 写 b'later' -> 同键重回滚
+        client.post(f"/objects/{key}/recover", json={})
+        client.put(f"/objects/{key}", json={"data_b64": b64(b"two")})
+        versions = client.get(f"/objects/{key}/versions").json()["versions"]
+        target = next(v["version_id"] for v in versions if not v["deleted"])
+        client.post(f"/objects/{key}/rollback",
+                    json={"version_id": target, "idempotency_key": "rb"})
+        client.put(f"/objects/{key}", json={"data_b64": b64(b"later")})
+        r = client.post(f"/objects/{key}/rollback",
+                        json={"version_id": target, "idempotency_key": "rb"})
+        assert r.status_code == 200
+        assert base64.b64decode(
+            client.get(f"/objects/{key}").json()["data_b64"]) == b"data"
+
+        # 同一对象两个上传会话共用同一条 complete 重试标识：各得各的结果
+        up1 = client.post(f"/uploads/{key}", json={"part_count": 1}).json()["upload_id"]
+        client.put(f"/uploads/{up1}/parts/1",
+                   json={"data_b64": b64(b"AAA"), "checksum": sha(b"AAA")})
+        assert client.post(f"/uploads/{up1}/complete",
+                           json={"idempotency_key": "c"}).status_code == 200
+
+        up2 = client.post(f"/uploads/{key}", json={"part_count": 1}).json()["upload_id"]
+        assert up2 != up1
+        client.put(f"/uploads/{up2}/parts/1",
+                   json={"data_b64": b64(b"BBB"), "checksum": sha(b"BBB")})
+        r = client.post(f"/uploads/{up2}/complete", json={"idempotency_key": "c"})
+        assert r.status_code == 200
+        assert base64.b64decode(
+            client.get(f"/objects/{key}").json()["data_b64"]) == b"BBB"
+    finally:
+        store._recovery = saved_recovery
+
+    store.reset()  # 清理，保证用例可重复执行

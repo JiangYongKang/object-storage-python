@@ -3,8 +3,16 @@
 一致性规则：
 - 所有状态变更在同一把可重入锁内完成；读取永远返回某一完整版本，绝不撕裂。
 - 版本单调递增；覆盖/删除/回滚/恢复一律追加新版本（删除为 tombstone），历史版本不可变。
-- 幂等记录按（对象 key, 幂等键）作用域保存首次结论：重复提交不重复占配额、不多出版本，
-  同一重试标识跨对象/跨上传互不影响；同一作用域换操作以 idempotency_conflict 拒绝。
+- 幂等记录的作用域精确到“这一笔提交”：
+  * 直接写/删/回滚/恢复按（对象 key, 幂等键）判重；
+  * 分块上传的 complete 按（upload_id, 幂等键）判重——同一对象的两个不同上传会话
+    即使共用同一条重试标识，也各自得到自己的结果，互不顶替。
+- 带状态的操作（删除/回滚/恢复）重放时先核对“对象当前状态是否仍停在这笔提交的结论上”：
+  * 状态没变：稳定重放首次结论，不重复占配额、不多出版本；
+  * 状态已被别的提交改动（如删除后被恢复、回滚后又被写入）：绝不返回与当前可读状态
+    对不上的旧结论，而是按当前状态重新执行一遍——能成功就真的生效（成功即可读到对应
+    状态/数据），受保留期/恢复窗口/配额阻拦则明确拒绝且对象状态原样不动。
+- 同一作用域换操作以 idempotency_conflict 拒绝。
 """
 
 from __future__ import annotations
@@ -46,35 +54,62 @@ class ObjectStore:
         # key -> 版本列表（version_id 升序，最后一个为当前版本）
         self._versions: dict[str, list[ObjectVersion]] = {}
         self._uploads: dict[str, MultipartUpload] = {}
-        # (对象 key, 幂等键) -> (操作标签, 首次结论)；按对象作用域隔离，重试不串味
-        self._committed: dict[tuple[str, str], tuple[str, ObjectVersion]] = {}
+        # 作用域 -> (操作标签, 首笔结论)：
+        #   ("obj", key, 幂等键)           直接写/删/回滚/恢复——同一对象内判重
+        #   ("upload", upload_id, 幂等键)  分块 complete——同一笔提交（会话）判重
+        self._committed: dict[tuple, tuple[str, ObjectVersion]] = {}
         self._used_bytes = 0
 
     # ---- 内部辅助（调用方须已持锁） ----
 
-    def _replay(
-        self, scope_key: str, idempotency_key: str | None, op: str
-    ) -> ObjectVersion | None:
-        """返回首次结论；同一幂等键换了操作则明确冲突；未记录过返回 None。"""
-        if idempotency_key is None:
+    @staticmethod
+    def _obj_scope(key: str, idempotency_key: str) -> tuple:
+        return ("obj", key, idempotency_key)
+
+    @staticmethod
+    def _upload_scope(upload_id: str, idempotency_key: str) -> tuple:
+        return ("upload", upload_id, idempotency_key)
+
+    def _replay(self, scope: tuple | None, op: str) -> ObjectVersion | None:
+        """返回首笔结论；同一作用域换了操作则明确冲突；未记录/无幂等键返回 None。"""
+        if scope is None:
             return None
-        record = self._committed.get((scope_key, idempotency_key))
+        record = self._committed.get(scope)
         if record is None:
             return None
         first_op, version = record
         if first_op != op:
             raise StorageRejected(
                 RejectReason.IDEMPOTENCY_CONFLICT,
-                f"幂等键 {idempotency_key!r} 已用于 {first_op}，"
-                f"不能再用于 {op}（key={scope_key!r}）",
+                f"该重试标识已用于 {first_op}，不能再用于 {op}"
+                f"（作用域={scope[0]}:{scope[1]!r}）",
             )
         return version
 
-    def _record(
-        self, scope_key: str, idempotency_key: str | None, op: str, version: ObjectVersion
-    ) -> None:
-        if idempotency_key is not None:
-            self._committed[(scope_key, idempotency_key)] = (op, version)
+    def _replay_object(
+        self, key: str, idempotency_key: str | None, op: str
+    ) -> ObjectVersion | None:
+        """对象级带状态操作（删除/回滚/恢复）的重放判定。
+
+        - 无幂等键或从未提交：返回 None，调用方按首次提交执行；
+        - 同作用域换了操作：idempotency_conflict；
+        - 对象当前版本仍是这笔提交的结论版本：重放该结论（状态没变，结论稳定）；
+        - 当前版本已是后来别的提交产生的版本：返回 None，调用方必须按当前状态重新执行，
+          绝不能把与现状对不上的旧结论当作成功返回。
+        """
+        if idempotency_key is None:
+            return None
+        version = self._replay(self._obj_scope(key, idempotency_key), op)
+        if version is None:
+            return None
+        versions = self._versions.get(key)
+        if versions and versions[-1].version_id == version.version_id:
+            return version
+        return None
+
+    def _record(self, scope: tuple | None, op: str, version: ObjectVersion) -> None:
+        if scope is not None:
+            self._committed[scope] = (op, version)
 
     # ---- 回滚与可恢复删除 ----
 
@@ -82,7 +117,7 @@ class ObjectStore:
         self,
         key: str,
         data: bytes,
-        idempotency_key: str | None,
+        scope: tuple | None,
         op: str,
         versions: list[ObjectVersion],
         current_size: int,
@@ -96,7 +131,7 @@ class ObjectStore:
         self._check_quota(key, len(data))
         self._used_bytes += len(data) - current_size
         version = self._append(versions, key, data)
-        self._record(key, idempotency_key, op, version)
+        self._record(scope, op, version)
         return version
 
     def rollback_object(
@@ -106,12 +141,20 @@ class ObjectStore:
 
         - 目标版本必须存在且不是墓碑；对象当前必须存活（已删除请走 recover）。
         - 受保留期（当前版本仍在保留期则拒绝）与配额（恢复后的容量）约束。
-        - 幂等：同一（对象, 提交键）重放首次结论，不重复出版本、不重复占配额。
+        - 幂等：同一（对象, 提交键）在对象状态未变时稳定重放首次结论，不重复出版本、
+          不重复占配额；若两次调用之间对象已被别的提交改动（如又写入了新内容），则按
+          当前状态重新回滚——成功后紧接着读到的内容必为目标版本数据；若此时被保留期或
+          配额拦住则拒绝且对象保持原样。
         """
         with self._lock:
-            replay = self._replay(key, idempotency_key, "rollback")
+            replay = self._replay_object(key, idempotency_key, "rollback")
             if replay is not None:
                 return replay
+            scope = (
+                self._obj_scope(key, idempotency_key)
+                if idempotency_key is not None
+                else None
+            )
             versions = self._versions.get(key)
             if not versions:
                 raise StorageRejected(
@@ -138,7 +181,7 @@ class ObjectStore:
                 )
             self._check_retention(key)
             return self._restore_as_new_version(
-                key, target.data, idempotency_key, "rollback",
+                key, target.data, scope, "rollback",
                 versions, current.size,
             )
 
@@ -149,13 +192,21 @@ class ObjectStore:
 
         - 仅在删除后的 recover_seconds 窗口内允许；窗口为 0 表示删除即不可恢复。
         - 对象当前必须是删除状态；历史版本在恢复期间一直可查。
-        - 恢复内容为墓碑之前最后一个非墓碑版本；受配额约束、留痕、可幂等重放。
+        - 恢复内容为墓碑之前最后一个非墓碑版本；受配额约束、留痕。
         - 不检查保留期：恢复不覆盖或删除任何已有数据。
+        - 幂等：对象状态未变（仍是本笔恢复结论）时稳定重放；若恢复后又被删除（状态已
+          分歧），同键重试按“最近一次删除”重新恢复：仍在窗口内就再次恢复，超出窗口或
+          超配额则拒绝、状态原样不动。
         """
         with self._lock:
-            replay = self._replay(key, idempotency_key, "recover")
+            replay = self._replay_object(key, idempotency_key, "recover")
             if replay is not None:
                 return replay
+            scope = (
+                self._obj_scope(key, idempotency_key)
+                if idempotency_key is not None
+                else None
+            )
             versions = self._versions.get(key)
             if not versions:
                 raise StorageRejected(
@@ -188,7 +239,7 @@ class ObjectStore:
                     f"key={key!r} 的墓碑之前没有可恢复的完整版本",
                 )
             return self._restore_as_new_version(
-                key, prior.data, idempotency_key, "recover",
+                key, prior.data, scope, "recover",
                 versions, current_size=0,  # 墓碑 size=0，不占容量
             )
 
@@ -251,18 +302,27 @@ class ObjectStore:
         return version
 
     def _commit(
-        self, key: str, data: bytes, idempotency_key: str | None, op: str = "write"
+        self,
+        key: str,
+        data: bytes,
+        idempotency_key: str | None,
+        op: str = "write",
+        scope: tuple | None = None,
     ) -> ObjectVersion:
-        replay = self._replay(key, idempotency_key, op)
+        if scope is None and idempotency_key is not None:
+            scope = self._obj_scope(key, idempotency_key)
+        replay = self._replay(scope, op)
         if replay is not None:
-            return replay  # 幂等重放：返回首次结论
+            # 重放语义：写入的结论是“这一笔提交产生过这个版本”。重试时即使对象后来被
+            # 别的提交改动，也只返回本笔版本、绝不再追加/顶替当前内容（不丢后来的写入）。
+            return replay
         self._check_retention(key)
         self._check_quota(key, len(data))
         versions = self._versions.setdefault(key, [])
         current = self._current(key)
         self._used_bytes += len(data) - (current.size if current else 0)
         version = self._append(versions, key, data)
-        self._record(key, idempotency_key, op, version)
+        self._record(scope, op, version)
         return version
 
     # ---- 简单写入 / 读取 / 删除 ----
@@ -301,14 +361,19 @@ class ObjectStore:
     def delete_object(
         self, key: str, idempotency_key: str | None = None
     ) -> ObjectVersion:
-        """软删除：追加墓碑版本，历史版本保留；幂等重试返回同一墓碑。
+        """软删除：追加墓碑版本，历史版本保留。
 
-        - 对象存活：保留期内拒绝；否则追加墓碑并释放容量。
-        - 已是删除状态：无幂等键的重复删除一律 object_not_found（结论稳定）；
-          带幂等键的同一笔提交重放首次墓碑，不重复占配额、不多出版本。
+        - 对象存活：保留期内拒绝（retention_violation，状态原样）；否则追加墓碑并释放容量。
+        - 幂等重试（同一对象、同一提交键）：
+          * 对象当前仍是本笔删除的墓碑：稳定重放该墓碑，不多出版本、不重复扣容量；
+          * 对象在两次调用之间被恢复（当前又存活）：按当前状态重新删除——成功必真删掉
+            （随后读不到），并把该提交的结论更新为新墓碑；此时若仍在保留期则拒绝、
+            状态原样不动；
+          * 对象已被另一笔提交删除（当前是别的墓碑）：object_not_found，状态不变。
+        - 无幂等键删除已删除对象：一律 object_not_found（结论稳定）。
         """
         with self._lock:
-            replay = self._replay(key, idempotency_key, "delete")
+            replay = self._replay_object(key, idempotency_key, "delete")
             if replay is not None:
                 return replay
             versions = self._versions.get(key)
@@ -321,7 +386,10 @@ class ObjectStore:
             self._check_retention(key)
             self._used_bytes -= current.size
             tombstone = self._append(versions, key, b"", deleted=True)
-            self._record(key, idempotency_key, "delete", tombstone)
+            if idempotency_key is not None:
+                self._record(
+                    self._obj_scope(key, idempotency_key), "delete", tombstone
+                )
             return tombstone
 
     def list_versions(self, key: str) -> list[ObjectVersion]:
@@ -407,8 +475,15 @@ class ObjectStore:
     ) -> ObjectVersion:
         with self._lock:
             upload = self._get_upload(upload_id)
-            # 幂等：同一（对象, 提交键）已完成过，即使会话已 completed 也返回首次结论
-            replay = self._replay(upload.key, idempotency_key, "write")
+            # 幂等作用域精确到“这一笔提交（本上传会话）”：同一（upload_id, 提交键）
+            # 已完成过就稳定返回本会话的首次结论（即使会话已 completed）；不同上传会话
+            # 即使属于同一对象、共用同一条重试标识，也互不重放、互不顶替。
+            scope = (
+                self._upload_scope(upload_id, idempotency_key)
+                if idempotency_key is not None
+                else None
+            )
+            replay = self._replay(scope, "write")
             if replay is not None:
                 return replay
             self._require_active(upload)
@@ -421,7 +496,9 @@ class ObjectStore:
                     f"缺少分片 {missing}，无法完成合并",
                 )
             data = b"".join(upload.parts[n].data for n in sorted(upload.parts))
-            version = self._commit(upload.key, data, idempotency_key)
+            version = self._commit(
+                upload.key, data, idempotency_key=None, scope=scope
+            )
             upload.state = "completed"
             upload.parts.clear()  # 合并后释放半成品
             return version
