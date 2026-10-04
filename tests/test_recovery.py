@@ -261,8 +261,13 @@ def test_idempotency_key_isolated_between_objects():
     assert ra is not rb
     assert store.get_object("a").data == b"aaa"
     assert store.get_object("b").data == b"bbb"
-    # 同一键在同一对象内仍保持幂等
-    assert store.put_object("a", b"aaa", idempotency_key="same") is va
+    # 同一键在同一对象内：两次重试之间对象已被改动（删除+恢复）时，
+    # 旧结论与当前状态对不上，按新一笔重新执行（追加新版本、内容不变）；
+    # 重新执行后状态稳定，再次重试才重放该次结论
+    v_re = store.put_object("a", b"aaa", idempotency_key="same")
+    assert v_re is not va and v_re.data == b"aaa"
+    assert store.get_object("a").data == b"aaa"
+    assert store.put_object("a", b"aaa", idempotency_key="same") is v_re
 
 
 def test_idempotency_key_isolated_between_uploads():
